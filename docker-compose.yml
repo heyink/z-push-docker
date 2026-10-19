@@ -1,0 +1,99 @@
+# Z-Push ActiveSync gateway (IMAP backend) behind caddy-docker-proxy
+#
+# Routing uses lucaslorentz/caddy-docker-proxy labels:
+#   https://github.com/lucaslorentz/caddy-docker-proxy
+# Network must match Caddy's ingress network (often named "caddy").
+#
+#   cp .env.example .env   # edit IMAP/SMTP + EAS_DOMAIN / AUTODISCOVER_DOMAIN
+#   docker compose pull && docker compose up -d
+#
+# Local build:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+
+services:
+  z-push:
+    image: ${IMAGE:-ghcr.io/heyink/z-push-docker:latest}
+    container_name: z-push
+    restart: unless-stopped
+    expose:
+      - "80"
+    environment:
+      TIMEZONE: ${TIMEZONE:-UTC}
+      BACKEND_PROVIDER: BackendIMAP
+      USE_FULLEMAIL_FOR_LOGIN: ${USE_FULLEMAIL_FOR_LOGIN:-true}
+      LOOSE_PROVISIONING: ${LOOSE_PROVISIONING:-true}
+      PROVISIONING: ${PROVISIONING:-true}
+      PING_INTERVAL: ${PING_INTERVAL:-30}
+      PING_HIGHER_BOUND_LIFETIME: ${PING_HIGHER_BOUND_LIFETIME:-900}
+      USE_CUSTOM_REMOTE_IP_HEADER: ${USE_CUSTOM_REMOTE_IP_HEADER:-HTTP_X_FORWARDED_FOR}
+      LOGLEVEL: ${LOGLEVEL:-INFO}
+      LOGAUTHFAIL: ${LOGAUTHFAIL:-false}
+      ZPUSH_HOST: ${ZPUSH_HOST:-${EAS_DOMAIN:-eas.example.com}}
+
+      IMAP_SERVER: ${IMAP_SERVER:?set IMAP_SERVER in .env}
+      IMAP_PORT: ${IMAP_PORT:-993}
+      IMAP_OPTIONS: ${IMAP_OPTIONS:-/ssl/norsh}
+      IMAP_FOLDER_CONFIGURED: "true"
+      IMAP_FOLDER_PREFIX: ${IMAP_FOLDER_PREFIX:-}
+      IMAP_FOLDER_PREFIX_IN_INBOX: ${IMAP_FOLDER_PREFIX_IN_INBOX:-false}
+      IMAP_FOLDER_INBOX: ${IMAP_FOLDER_INBOX:-INBOX}
+      IMAP_FOLDER_SENT: ${IMAP_FOLDER_SENT:-Sent}
+      IMAP_FOLDER_DRAFT: ${IMAP_FOLDER_DRAFT:-Drafts}
+      IMAP_FOLDER_TRASH: ${IMAP_FOLDER_TRASH:-Trash}
+      IMAP_FOLDER_SPAM: ${IMAP_FOLDER_SPAM:-Junk}
+      IMAP_FOLDER_ARCHIVE: ${IMAP_FOLDER_ARCHIVE:-Archive}
+      IMAP_EXCLUDED_FOLDERS: ${IMAP_EXCLUDED_FOLDERS:-}
+
+      IMAP_SMTP_METHOD: ${IMAP_SMTP_METHOD:-smtp}
+      IMAP_SMTP_HOST: ${IMAP_SMTP_HOST:-${IMAP_SERVER}}
+      IMAP_SMTP_PORT: ${IMAP_SMTP_PORT:-465}
+      IMAP_SMTP_AUTH: ${IMAP_SMTP_AUTH:-true}
+      IMAP_SMTP_SSL: ${IMAP_SMTP_SSL:-true}
+      IMAP_DEFAULTFROM: ${IMAP_DEFAULTFROM:-}
+    volumes:
+      - zpush_state:/var/lib/z-push
+      - zpush_logs:/var/log/z-push
+    networks:
+      - caddy_net
+    labels:
+      # Site block from env (compose interpolates before creating the container).
+      # Multi-domain: https://github.com/lucaslorentz/caddy-docker-proxy#examples
+      # Nested labels: https://github.com/lucaslorentz/caddy-docker-proxy#tokens-and-arguments
+      caddy: "${EAS_DOMAIN:-eas.example.com}, ${AUTODISCOVER_DOMAIN:-autodiscover.example.com}"
+      # Quote templates in YAML — https://github.com/lucaslorentz/caddy-docker-proxy#upstreams
+      caddy.reverse_proxy: "{{upstreams 80}}"
+      caddy.reverse_proxy.flush_interval: "-1"
+      caddy.reverse_proxy.transport: http
+      caddy.reverse_proxy.transport.read_timeout: 30m
+      caddy.reverse_proxy.transport.write_timeout: 30m
+      caddy.reverse_proxy.transport.response_header_timeout: 30m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  greenmail:
+    profiles: ["test"]
+    image: greenmail/standalone:2.1.2
+    container_name: z-push-greenmail
+    environment:
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.all
+        -Dgreenmail.users=test:test@example.com
+        -Dgreenmail.hostname=0.0.0.0
+    ports:
+      - "3143:3143"
+      - "3025:3025"
+    networks:
+      - caddy_net
+
+volumes:
+  zpush_state:
+  zpush_logs:
+
+networks:
+  caddy_net:
+    name: ${CADDY_NETWORK:-caddy}
+    external: true

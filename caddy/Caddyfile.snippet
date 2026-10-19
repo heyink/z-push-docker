@@ -1,0 +1,23 @@
+# Optional alternative if you do NOT use caddy-docker-proxy labels.
+# Replace eas.example.com / autodiscover.example.com and ensure the
+# container is reachable as "z-push:80" on a shared Docker network.
+
+eas.example.com, autodiscover.example.com {
+	encode gzip
+
+	reverse_proxy z-push:80 {
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+			dial_timeout 30s
+			response_header_timeout 30m
+		}
+		flush_interval -1
+		header_up Host {host}
+		header_up Authorization {http.request.header.Authorization}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+}

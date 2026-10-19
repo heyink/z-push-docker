@@ -1,0 +1,8 @@
+# Optional override for local builds (does not push to GHCR).
+services:
+  z-push:
+    image: z-push-imap:2.7.6
+    build:
+      context: .
+      args:
+        ZPUSH_VERSION: ${ZPUSH_VERSION:-2.7.6}
