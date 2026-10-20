@@ -1,0 +1,33 @@
+Allow php://stderr / php://stdout as LOGFILE/LOGERRORFILE (Docker stdout logging).
+Upstream checks touch()/is_writable() which fail for php:// streams.
+
+--- a/src/lib/core/zpush.php
++++ b/src/lib/core/zpush.php
+@@ -248,10 +248,10 @@
+             if (!file_exists(LOGFILEDIR))
+                 throw new FatalMisconfigurationException("The configured LOGFILEDIR does not exist or can not be accessed.");
+ 
+-            if ((!file_exists(LOGFILE) && !touch(LOGFILE)) || !is_writable(LOGFILE))
++            if (strpos(LOGFILE, 'php://') !== 0 && ((!file_exists(LOGFILE) && !touch(LOGFILE)) || !is_writable(LOGFILE)))
+                 throw new FatalMisconfigurationException("The configured LOGFILE can not be modified.");
+ 
+-            if ((!file_exists(LOGERRORFILE) && !touch(LOGERRORFILE)) || !is_writable(LOGERRORFILE))
++            if (strpos(LOGERRORFILE, 'php://') !== 0 && ((!file_exists(LOGERRORFILE) && !touch(LOGERRORFILE)) || !is_writable(LOGERRORFILE)))
+                 throw new FatalMisconfigurationException("The configured LOGERRORFILE can not be modified.");
+ 
+             // check ownership on the (eventually) just created files
+--- a/src/autodiscover/autodiscover.php
++++ b/src/autodiscover/autodiscover.php
+@@ -368,10 +368,10 @@
+             if (!file_exists(LOGFILEDIR))
+                 throw new FatalMisconfigurationException("The configured LOGFILEDIR does not exist or can not be accessed.");
+ 
+-            if ((!file_exists(LOGFILE) && !touch(LOGFILE)) || !is_writable(LOGFILE))
++            if (strpos(LOGFILE, 'php://') !== 0 && ((!file_exists(LOGFILE) && !touch(LOGFILE)) || !is_writable(LOGFILE)))
+                 throw new FatalMisconfigurationException("The configured LOGFILE can not be modified.");
+ 
+-            if ((!file_exists(LOGERRORFILE) && !touch(LOGERRORFILE)) || !is_writable(LOGERRORFILE))
++            if (strpos(LOGERRORFILE, 'php://') !== 0 && ((!file_exists(LOGERRORFILE) && !touch(LOGERRORFILE)) || !is_writable(LOGERRORFILE)))
+                 throw new FatalMisconfigurationException("The configured LOGERRORFILE can not be modified.");
+ 
+             // check ownership on the (eventually) just created files

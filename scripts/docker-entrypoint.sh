@@ -1,218 +1,175 @@
 #!/bin/bash
+# Generate Z-Push config from environment variables, then exec Apache.
 set -euo pipefail
 
 ZPUSH_HOME="${ZPUSH_HOME:-/usr/share/z-push}"
 STATE_DIR="${STATE_DIR:-/var/lib/z-push}"
 LOG_DIR="${LOG_DIR:-/var/log/z-push}"
+SETCFG="php /usr/local/lib/z-push-docker/zpush-setconfig.php"
+
+log() { echo "[z-push] $*"; }
+warn() { echo "[z-push] WARNING: $*" >&2; }
+env_or() { local v="${!1-}"; if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi; }
+is_true() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|on) return 0;; *) return 1;; esac; }
+loglevel_const() {
+  local l; l="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"; l="${l#LOGLEVEL_}"
+  case "$l" in OFF|FATAL|ERROR|WARN|INFO|DEBUG|WBXML|DEVICEID|WBXMLSTACK) echo "LOGLEVEL_$l";;
+    *) warn "unknown log level '$1', using WARN" ; echo LOGLEVEL_WARN;; esac
+}
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
-chown -R www-data:www-data "$STATE_DIR" "$LOG_DIR" || true
+chown -R www-data:www-data "$STATE_DIR" "$LOG_DIR"
 
-env_or() {
-  local v="${!1-}"
-  if [ -n "${v}" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
-}
+# ---------- time zone ----------
+TIMEZONE="${TIMEZONE:-${TZ:-UTC}}"
+if [ ! -e "/usr/share/zoneinfo/$TIMEZONE" ]; then warn "unknown TIMEZONE '$TIMEZONE', using UTC"; TIMEZONE=UTC; fi
+export TZ="$TIMEZONE"
 
-php_bool() {
-  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-    1|true|yes|on) echo true ;;
-    *) echo false ;;
-  esac
-}
-
-php_quote() {
-  printf "%s" "$1" | sed "s/'/\\\\'/g"
-}
-
-php_sed_define() {
-  local file="$1" const="$2" value="$3"
-  sed -i -E "s#define\('${const}'[[:space:]]*,[[:space:]]*[^)]+\)#define('${const}', ${value})#g" "$file"
-}
-
-# ---- main settings ----
-TIMEZONE="$(env_or TIMEZONE Asia/Shanghai)"
-BACKEND_PROVIDER="$(env_or BACKEND_PROVIDER BackendIMAP)"
-USE_FULLEMAIL_FOR_LOGIN="$(php_bool "$(env_or USE_FULLEMAIL_FOR_LOGIN true)")"
-LOOSE_PROVISIONING="$(php_bool "$(env_or LOOSE_PROVISIONING true)")"
-PROVISIONING="$(php_bool "$(env_or PROVISIONING true)")"
-PING_INTERVAL="$(env_or PING_INTERVAL 30)"
-PING_HIGHER_BOUND_LIFETIME="$(env_or PING_HIGHER_BOUND_LIFETIME false)"
-USE_CUSTOM_REMOTE_IP_HEADER="$(env_or USE_CUSTOM_REMOTE_IP_HEADER HTTP_X_FORWARDED_FOR)"
-LOGLEVEL_NAME="$(env_or LOGLEVEL LOGLEVEL_INFO)"
-LOGAUTHFAIL="$(php_bool "$(env_or LOGAUTHFAIL false)")"
-
-case "$LOGLEVEL_NAME" in
-  LOGLEVEL_*) ;;
-  OFF|FATAL|ERROR|WARN|INFO|DEBUG|WBXML|DEVICEID|WBXMLSTACK)
-    LOGLEVEL_NAME="LOGLEVEL_${LOGLEVEL_NAME}" ;;
-  *) LOGLEVEL_NAME="LOGLEVEL_INFO" ;;
+# ---------- logging ----------
+LOG_TARGET="$(env_or LOG_TARGET stdout | tr '[:upper:]' '[:lower:]')"
+LOGLEVEL_C="$(loglevel_const "$(env_or LOGLEVEL WARN)")"
+AD_LOGLEVEL_C="$(loglevel_const "$(env_or AUTODISCOVER_LOGLEVEL "$(env_or LOGLEVEL WARN)")")"
+case "$LOG_TARGET" in
+  stdout)
+    # Everything to the container log; WARN+ would otherwise be written twice.
+    ZP_LOGFILE='php://stderr'; ZP_LOGERRORFILE='/dev/null'
+    AD_LOGFILE='php://stderr'; AD_LOGERRORFILE='/dev/null' ;;
+  file)
+    ZP_LOGFILE="$LOG_DIR/z-push.log"; ZP_LOGERRORFILE="$LOG_DIR/z-push-error.log"
+    AD_LOGFILE="$LOG_DIR/autodiscover.log"; AD_LOGERRORFILE="$LOG_DIR/autodiscover-error.log" ;;
+  *) echo "[z-push] LOG_TARGET must be 'stdout' or 'file'" >&2; exit 1 ;;
 esac
 
-if [ "$(printf '%s' "$USE_CUSTOM_REMOTE_IP_HEADER" | tr '[:upper:]' '[:lower:]')" = "false" ]; then
-  REMOTE_IP_PHP="false"
-else
-  REMOTE_IP_PHP="'$(php_quote "$USE_CUSTOM_REMOTE_IP_HEADER")'"
+# ---------- PHP runtime ini ----------
+{
+  echo "memory_limit = $(env_or PHP_MEMORY_LIMIT 256M)"
+  echo "date.timezone = $TIMEZONE"
+  if [ "$LOG_TARGET" = file ]; then echo "error_log = $LOG_DIR/php-error.log"; fi
+} > /usr/local/etc/php/conf.d/zz-runtime.ini
+
+# ---------- core config.php ----------
+CFG="$ZPUSH_HOME/config.php"
+cp "$CFG.dist" "$CFG"
+$SETCFG "$CFG" \
+  TIMEZONE str "$TIMEZONE" \
+  STATE_DIR str "${STATE_DIR%/}/" \
+  LOGBACKEND str filelog \
+  LOGFILEDIR str "${LOG_DIR%/}/" \
+  LOGFILE str "$ZP_LOGFILE" \
+  LOGERRORFILE str "$ZP_LOGERRORFILE" \
+  LOGLEVEL raw "$LOGLEVEL_C" \
+  LOGAUTHFAIL bool "$(env_or LOGAUTHFAIL false)" \
+  BACKEND_PROVIDER str "$(env_or BACKEND_PROVIDER BackendIMAP)" \
+  USE_FULLEMAIL_FOR_LOGIN bool "$(env_or USE_FULLEMAIL_FOR_LOGIN true)" \
+  PROVISIONING bool "$(env_or PROVISIONING true)" \
+  LOOSE_PROVISIONING bool "$(env_or LOOSE_PROVISIONING true)" \
+  PING_INTERVAL int "$(env_or PING_INTERVAL 30)" \
+  PING_LOWER_BOUND_LIFETIME intfalse "$(env_or PING_LOWER_BOUND_LIFETIME false)" \
+  PING_HIGHER_BOUND_LIFETIME intfalse "$(env_or PING_HIGHER_BOUND_LIFETIME 900)" \
+  RETRY_AFTER_DELAY int "$(env_or RETRY_AFTER_DELAY 300)" \
+  USE_CUSTOM_REMOTE_IP_HEADER strfalse "$(env_or USE_CUSTOM_REMOTE_IP_HEADER HTTP_X_FORWARDED_FOR)" \
+  SCRIPT_TIMEOUT int 0
+
+PHB="$(env_or PING_HIGHER_BOUND_LIFETIME 900)"
+if [ "$PHB" != false ] && [ "$PHB" -gt 1740 ] 2>/dev/null; then
+  warn "PING_HIGHER_BOUND_LIFETIME=$PHB is close to/above Apache Timeout 1800s; keep it well below your proxy timeout"
 fi
 
-PING_HIGHER_PHP="$PING_HIGHER_BOUND_LIFETIME"
-if [ "$(printf '%s' "$PING_HIGHER_BOUND_LIFETIME" | tr '[:upper:]' '[:lower:]')" = "false" ]; then
-  PING_HIGHER_PHP="false"
-fi
-
-if [ ! -f "${ZPUSH_HOME}/config.php.dist" ]; then
-  cp "${ZPUSH_HOME}/config.php" "${ZPUSH_HOME}/config.php.dist"
-fi
-cp "${ZPUSH_HOME}/config.php.dist" "${ZPUSH_HOME}/config.php"
-
-php_sed_define "${ZPUSH_HOME}/config.php" TIMEZONE "'$(php_quote "$TIMEZONE")'"
-php_sed_define "${ZPUSH_HOME}/config.php" STATE_DIR "'$(php_quote "$STATE_DIR")/'"
-php_sed_define "${ZPUSH_HOME}/config.php" LOGBACKEND "'filelog'"
-php_sed_define "${ZPUSH_HOME}/config.php" LOGLEVEL "${LOGLEVEL_NAME}"
-php_sed_define "${ZPUSH_HOME}/config.php" LOGAUTHFAIL "${LOGAUTHFAIL}"
-php_sed_define "${ZPUSH_HOME}/config.php" LOGFILEDIR "'$(php_quote "$LOG_DIR")/'"
-php_sed_define "${ZPUSH_HOME}/config.php" BACKEND_PROVIDER "'$(php_quote "$BACKEND_PROVIDER")'"
-php_sed_define "${ZPUSH_HOME}/config.php" USE_FULLEMAIL_FOR_LOGIN "${USE_FULLEMAIL_FOR_LOGIN}"
-php_sed_define "${ZPUSH_HOME}/config.php" PROVISIONING "${PROVISIONING}"
-php_sed_define "${ZPUSH_HOME}/config.php" LOOSE_PROVISIONING "${LOOSE_PROVISIONING}"
-php_sed_define "${ZPUSH_HOME}/config.php" PING_INTERVAL "${PING_INTERVAL}"
-php_sed_define "${ZPUSH_HOME}/config.php" PING_HIGHER_BOUND_LIFETIME "${PING_HIGHER_PHP}"
-php_sed_define "${ZPUSH_HOME}/config.php" USE_CUSTOM_REMOTE_IP_HEADER "${REMOTE_IP_PHP}"
-php_sed_define "${ZPUSH_HOME}/config.php" SCRIPT_TIMEOUT "0"
-
-# ---- IMAP backend ----
+# ---------- IMAP backend ----------
+# Older docs told users to write '&' as '\&' (sed escaping); values are now written verbatim.
+for v in IMAP_FOLDER_INBOX IMAP_FOLDER_SENT IMAP_FOLDER_DRAFT IMAP_FOLDER_TRASH IMAP_FOLDER_SPAM IMAP_FOLDER_ARCHIVE IMAP_FOLDER_PREFIX; do
+  if [ -n "${!v-}" ]; then val="${!v}"; val="${val//'\&'/'&'}"; printf -v "$v" '%s' "$val"; fi
+done
 IMAP_SERVER="$(env_or IMAP_SERVER localhost)"
-IMAP_PORT="$(env_or IMAP_PORT 993)"
-IMAP_OPTIONS="$(env_or IMAP_OPTIONS /ssl/norsh/novalidate-cert)"
-IMAP_FOLDER_CONFIGURED="$(php_bool "$(env_or IMAP_FOLDER_CONFIGURED true)")"
-IMAP_FOLDER_PREFIX="$(env_or IMAP_FOLDER_PREFIX '')"
-IMAP_FOLDER_PREFIX_IN_INBOX="$(php_bool "$(env_or IMAP_FOLDER_PREFIX_IN_INBOX false)")"
-IMAP_FOLDER_INBOX="$(env_or IMAP_FOLDER_INBOX INBOX)"
-IMAP_FOLDER_SENT="$(env_or IMAP_FOLDER_SENT Sent)"
-IMAP_FOLDER_DRAFT="$(env_or IMAP_FOLDER_DRAFT Drafts)"
-IMAP_FOLDER_TRASH="$(env_or IMAP_FOLDER_TRASH Trash)"
-IMAP_FOLDER_SPAM="$(env_or IMAP_FOLDER_SPAM Junk)"
-IMAP_FOLDER_ARCHIVE="$(env_or IMAP_FOLDER_ARCHIVE Archive)"
-IMAP_SMTP_METHOD="$(env_or IMAP_SMTP_METHOD smtp)"
+IMAP_OPTIONS="$(env_or IMAP_OPTIONS /ssl/norsh)"
+case "$IMAP_OPTIONS" in *novalidate-cert*) warn "IMAP_OPTIONS contains /novalidate-cert: the IMAP server certificate is NOT verified";; esac
 IMAP_SMTP_HOST="$(env_or IMAP_SMTP_HOST "$IMAP_SERVER")"
-IMAP_SMTP_PORT="$(env_or IMAP_SMTP_PORT 587)"
-IMAP_SMTP_AUTH="$(php_bool "$(env_or IMAP_SMTP_AUTH true)")"
-IMAP_SMTP_SSL="$(php_bool "$(env_or IMAP_SMTP_SSL false)")"
-if [ "$IMAP_SMTP_SSL" = "true" ]; then
-  case "$IMAP_SMTP_HOST" in
-    ssl://*|tls://*) ;;
-    *) IMAP_SMTP_HOST="ssl://${IMAP_SMTP_HOST}" ;;
-  esac
+IMAP_SMTP_PORT="$(env_or IMAP_SMTP_PORT 465)"
+if is_true "$(env_or IMAP_SMTP_SSL true)"; then
+  case "$IMAP_SMTP_HOST" in ssl://*|tls://*) ;; *) IMAP_SMTP_HOST="ssl://$IMAP_SMTP_HOST";; esac
 fi
-IMAP_DEFAULTFROM="$(env_or IMAP_DEFAULTFROM '')"
-IMAP_EXCLUDED_FOLDERS="$(env_or IMAP_EXCLUDED_FOLDERS '')"
+SMTP_VERIFY=true; is_true "$(env_or IMAP_SMTP_VERIFY_PEER true)" || { SMTP_VERIFY=false; warn "IMAP_SMTP_VERIFY_PEER=false: the SMTP server certificate is NOT verified"; }
+ZPUSH_HOST="$(env_or ZPUSH_HOST "${EAS_DOMAIN:-}")"
+SMTP_EHLO="$(env_or IMAP_SMTP_EHLO "$ZPUSH_HOST")"
+SMTP_JSON="$(SMTP_HOST="$IMAP_SMTP_HOST" SMTP_PORT="$IMAP_SMTP_PORT" SMTP_AUTH="$(env_or IMAP_SMTP_AUTH true)" \
+  SMTP_VERIFY="$SMTP_VERIFY" SMTP_EHLO="$SMTP_EHLO" php -r '
+  $v = getenv("SMTP_VERIFY") === "true";
+  $p = ["host" => getenv("SMTP_HOST"), "port" => (int)getenv("SMTP_PORT"),
+        "auth" => in_array(strtolower(getenv("SMTP_AUTH")), ["1","true","yes","on"], true),
+        "username" => "imap_username", "password" => "imap_password",
+        "verify_peer" => $v, "verify_peer_name" => $v, "allow_self_signed" => !$v];
+  if (getenv("SMTP_EHLO") !== "") $p["localhost"] = getenv("SMTP_EHLO");
+  echo json_encode($p);')"
 
-if [ ! -f "${ZPUSH_HOME}/backend/imap/config.php.dist" ]; then
-  cp "${ZPUSH_HOME}/backend/imap/config.php" "${ZPUSH_HOME}/backend/imap/config.php.dist"
+ICFG="$ZPUSH_HOME/backend/imap/config.php"
+cp "$ICFG.dist" "$ICFG"
+IMAP_ARGS=(
+  IMAP_SERVER str "$IMAP_SERVER"
+  IMAP_PORT int "$(env_or IMAP_PORT 993)"
+  IMAP_OPTIONS str "$IMAP_OPTIONS"
+  IMAP_AUTOSEEN_ON_DELETE bool "$(env_or IMAP_AUTOSEEN_ON_DELETE false)"
+  IMAP_FOLDER_CONFIGURED bool "$(env_or IMAP_FOLDER_CONFIGURED true)"
+  IMAP_FOLDER_PREFIX str "$(env_or IMAP_FOLDER_PREFIX '')"
+  IMAP_FOLDER_PREFIX_IN_INBOX bool "$(env_or IMAP_FOLDER_PREFIX_IN_INBOX false)"
+  IMAP_FOLDER_INBOX str "$(env_or IMAP_FOLDER_INBOX INBOX)"
+  IMAP_FOLDER_SENT str "$(env_or IMAP_FOLDER_SENT Sent)"
+  IMAP_FOLDER_DRAFT str "$(env_or IMAP_FOLDER_DRAFT Drafts)"
+  IMAP_FOLDER_TRASH str "$(env_or IMAP_FOLDER_TRASH Trash)"
+  IMAP_FOLDER_SPAM str "$(env_or IMAP_FOLDER_SPAM Junk)"
+  IMAP_FOLDER_ARCHIVE str "$(env_or IMAP_FOLDER_ARCHIVE Archive)"
+  IMAP_INLINE_FORWARD bool "$(env_or IMAP_INLINE_FORWARD true)"
+  IMAP_EXCLUDED_FOLDERS str "$(env_or IMAP_EXCLUDED_FOLDERS '')"
+  IMAP_DEFAULTFROM str "$(env_or IMAP_DEFAULTFROM '')"
+  IMAP_SMTP_METHOD str "$(env_or IMAP_SMTP_METHOD smtp)"
+  IMAP_SEARCH_CHARSET str "$(env_or IMAP_SEARCH_CHARSET UTF-8)"
+)
+# GSSAPI disabled by default: php-imap is built with Kerberos and would try it first.
+IMAP_DISABLE_AUTH="${IMAP_DISABLE_AUTHENTICATOR-GSSAPI}"
+if [ -n "$IMAP_DISABLE_AUTH" ]; then IMAP_ARGS+=(IMAP_DISABLE_AUTHENTICATOR str "$IMAP_DISABLE_AUTH"); fi
+$SETCFG "$ICFG" "${IMAP_ARGS[@]}" --smtp-params "$SMTP_JSON"
+
+# ---------- Autodiscover ----------
+ACFG="$ZPUSH_HOME/autodiscover/config.php"
+cp "$ACFG.dist" "$ACFG"
+AD_ARGS=(
+  TIMEZONE str "$TIMEZONE"
+  USE_FULLEMAIL_FOR_LOGIN bool "$(env_or USE_FULLEMAIL_FOR_LOGIN true)"
+  BACKEND_PROVIDER str "$(env_or BACKEND_PROVIDER BackendIMAP)"
+  LOGFILEDIR str "${LOG_DIR%/}/"
+  LOGFILE str "$AD_LOGFILE"
+  LOGERRORFILE str "$AD_LOGERRORFILE"
+  LOGLEVEL raw "$AD_LOGLEVEL_C"
+)
+if [ -n "$ZPUSH_HOST" ]; then AD_ARGS+=(ZPUSH_HOST str "$ZPUSH_HOST"); fi
+$SETCFG "$ACFG" "${AD_ARGS[@]}"
+
+# ---------- permissions + lint ----------
+for f in "$CFG" "$ICFG" "$ACFG"; do
+  chown root:www-data "$f"; chmod 640 "$f"
+  php -l "$f" >/dev/null || { echo "[z-push] syntax error in generated $f" >&2; exit 1; }
+done
+
+# ---------- optional log rotation (file mode) ----------
+if [ "$LOG_TARGET" = file ]; then
+  MAX_MB="$(env_or LOG_MAX_SIZE_MB 20)"; MAX_FILES="$(env_or LOG_MAX_FILES 5)"
+  (
+    set +e
+    while sleep "$(env_or LOG_ROTATE_INTERVAL 600)"; do
+      for f in "$LOG_DIR"/*.log; do
+        [ -f "$f" ] || continue
+        [ "$(stat -c %s "$f")" -ge $((MAX_MB * 1024 * 1024)) ] || continue
+        for n in $(seq $((MAX_FILES - 1)) -1 1); do if [ -f "$f.$n" ]; then mv -f "$f.$n" "$f.$((n + 1))"; fi; done
+        cp -p "$f" "$f.1" && : > "$f"
+        rm -f "$f.$((MAX_FILES + 1))"
+      done
+    done
+  ) &
+  log "file logging in $LOG_DIR (rotate at ${MAX_MB}MB, keep $MAX_FILES)"
 fi
-cp "${ZPUSH_HOME}/backend/imap/config.php.dist" "${ZPUSH_HOME}/backend/imap/config.php"
-IMAP_CFG="${ZPUSH_HOME}/backend/imap/config.php"
 
-php_sed_define "$IMAP_CFG" IMAP_SERVER "'$(php_quote "$IMAP_SERVER")'"
-php_sed_define "$IMAP_CFG" IMAP_PORT "${IMAP_PORT}"
-php_sed_define "$IMAP_CFG" IMAP_OPTIONS "'$(php_quote "$IMAP_OPTIONS")'"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_CONFIGURED "${IMAP_FOLDER_CONFIGURED}"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_PREFIX "'$(php_quote "$IMAP_FOLDER_PREFIX")'"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_PREFIX_IN_INBOX "${IMAP_FOLDER_PREFIX_IN_INBOX}"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_INBOX "'$(php_quote "$IMAP_FOLDER_INBOX")'"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_SENT "'$(php_quote "$IMAP_FOLDER_SENT")'"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_DRAFT "'$(php_quote "$IMAP_FOLDER_DRAFT")'"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_TRASH "'$(php_quote "$IMAP_FOLDER_TRASH")'"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_SPAM "'$(php_quote "$IMAP_FOLDER_SPAM")'"
-php_sed_define "$IMAP_CFG" IMAP_FOLDER_ARCHIVE "'$(php_quote "$IMAP_FOLDER_ARCHIVE")'"
-php_sed_define "$IMAP_CFG" IMAP_SMTP_METHOD "'$(php_quote "$IMAP_SMTP_METHOD")'"
-php_sed_define "$IMAP_CFG" IMAP_DEFAULTFROM "'$(php_quote "$IMAP_DEFAULTFROM")'"
-php_sed_define "$IMAP_CFG" IMAP_EXCLUDED_FOLDERS "'$(php_quote "$IMAP_EXCLUDED_FOLDERS")'"
-
-# Inject SMTP params before MAIL_MIMEPART_CRLF; strip prior $imap_smtp_params assignments
-AUTH_PHP="$IMAP_SMTP_AUTH"
-SMTP_HOST_Q="$(php_quote "$IMAP_SMTP_HOST")"
-TMP_CFG="$(mktemp)"
-awk '
-  /^global \$imap_smtp_params/ {skip=1; next}
-  skip==1 {
-    if ($0 ~ /^define\(/) { skip=0 }
-    else if ($0 ~ /^\/\/ If you are using IMAP_SMTP_METHOD/) { skip=0 }
-    else next
-  }
-  { print }
-' "$IMAP_CFG" > "$TMP_CFG"
-mv "$TMP_CFG" "$IMAP_CFG"
-
-TMP_BLOCK="$(mktemp)"
-cat > "$TMP_BLOCK" <<SMTPEOF
-global \$imap_smtp_params;
-\$imap_smtp_params = array(
-    'host' => '${SMTP_HOST_Q}',
-    'port' => ${IMAP_SMTP_PORT},
-    'auth' => ${AUTH_PHP},
-    'username' => 'imap_username',
-    'password' => 'imap_password',
-    'verify_peer' => false,
-    'verify_peer_name' => false,
-    'allow_self_signed' => true,
-);
-
-SMTPEOF
-
-TMP_CFG="$(mktemp)"
-awk -v bf="$TMP_BLOCK" '
-  index($0, "define('\''MAIL_MIMEPART_CRLF'\''") == 1 || $0 ~ /define\('\''MAIL_MIMEPART_CRLF'\''/ {
-    while ((getline line < bf) > 0) print line
-    close(bf)
-  }
-  { print }
-' "$IMAP_CFG" > "$TMP_CFG"
-mv "$TMP_CFG" "$IMAP_CFG"
-rm -f "$TMP_BLOCK"
-
-# ---- Autodiscover ----
-ZPUSH_HOST="$(env_or ZPUSH_HOST '')"
-AD_USE_FULLEMAIL="$(php_bool "$(env_or USE_FULLEMAIL_FOR_LOGIN true)")"
-
-if [ ! -f "${ZPUSH_HOME}/autodiscover/config.php.dist" ]; then
-  cp "${ZPUSH_HOME}/autodiscover/config.php" "${ZPUSH_HOME}/autodiscover/config.php.dist"
-fi
-cp "${ZPUSH_HOME}/autodiscover/config.php.dist" "${ZPUSH_HOME}/autodiscover/config.php"
-AD_CFG="${ZPUSH_HOME}/autodiscover/config.php"
-
-if [ -n "$ZPUSH_HOST" ]; then
-  if grep -q "ZPUSH_HOST" "$AD_CFG"; then
-    sed -i -E "s#^[[:space:]]*//[[:space:]]*define\('ZPUSH_HOST'.*#define('ZPUSH_HOST', '$(php_quote "$ZPUSH_HOST")');#" "$AD_CFG"
-    php_sed_define "$AD_CFG" ZPUSH_HOST "'$(php_quote "$ZPUSH_HOST")'"
-  else
-    sed -i "1a define('ZPUSH_HOST', '$(php_quote "$ZPUSH_HOST")');" "$AD_CFG"
-  fi
-fi
-php_sed_define "$AD_CFG" TIMEZONE "'$(php_quote "$TIMEZONE")'"
-php_sed_define "$AD_CFG" USE_FULLEMAIL_FOR_LOGIN "${AD_USE_FULLEMAIL}"
-php_sed_define "$AD_CFG" BACKEND_PROVIDER "'$(php_quote "$BACKEND_PROVIDER")'"
-php_sed_define "$AD_CFG" LOGFILEDIR "'$(php_quote "$LOG_DIR")/'"
-
-# Ensure Apache (www-data) can read generated configs
-chown -R www-data:www-data \
-  "${ZPUSH_HOME}/config.php" \
-  "${ZPUSH_HOME}/backend/imap/config.php" \
-  "${ZPUSH_HOME}/autodiscover/config.php" \
-  "${ZPUSH_HOME}/config.php.dist" \
-  "${ZPUSH_HOME}/backend/imap/config.php.dist" \
-  "${ZPUSH_HOME}/autodiscover/config.php.dist" 2>/dev/null || true
-chmod 640 \
-  "${ZPUSH_HOME}/config.php" \
-  "${ZPUSH_HOME}/backend/imap/config.php" \
-  "${ZPUSH_HOME}/autodiscover/config.php"
-
-php -l "${ZPUSH_HOME}/config.php"
-php -l "${ZPUSH_HOME}/backend/imap/config.php"
-php -l "${ZPUSH_HOME}/autodiscover/config.php"
-
-echo "[z-push] IMAP ${IMAP_SERVER}:${IMAP_PORT} options=${IMAP_OPTIONS}"
-echo "[z-push] SMTP method=${IMAP_SMTP_METHOD} host=${IMAP_SMTP_HOST}:${IMAP_SMTP_PORT} auth=${IMAP_SMTP_AUTH}"
-echo "[z-push] folders configured=${IMAP_FOLDER_CONFIGURED} sent=${IMAP_FOLDER_SENT} trash=${IMAP_FOLDER_TRASH}"
-echo "[z-push] ZPUSH_HOST=${ZPUSH_HOST:-'(unset)'}"
+log "IMAP $IMAP_SERVER:$(env_or IMAP_PORT 993) options=$IMAP_OPTIONS"
+log "SMTP $IMAP_SMTP_HOST:$IMAP_SMTP_PORT verify_peer=$SMTP_VERIFY ehlo=${SMTP_EHLO:-localhost}"
+log "folders sent=$(env_or IMAP_FOLDER_SENT Sent) trash=$(env_or IMAP_FOLDER_TRASH Trash) excluded=$(env_or IMAP_EXCLUDED_FOLDERS '')"
+log "log target=$LOG_TARGET level=$LOGLEVEL_C tz=$TIMEZONE ZPUSH_HOST=${ZPUSH_HOST:-(unset)}"
 
 exec "$@"

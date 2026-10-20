@@ -1,0 +1,15 @@
+Log AuthenticationRequiredException at INFO instead of FATAL (every unauthenticated
+request, incl. device probes and the container health check, was logged as FATAL).
+
+--- a/src/index.php
++++ b/src/index.php
+@@ -170,7 +170,8 @@
+         if (Request::GetUserAgent())
+             ZLog::Write(LOGLEVEL_INFO, sprintf("User-agent: '%s'", Request::GetUserAgent()));
+ 
+-        ZLog::Write(LOGLEVEL_FATAL, sprintf('Exception: (%s) - %s', $exclass, $exception_message));
++        // unauthenticated requests (devices probing, health checks) are not fatal; failed logins are logged via LOGAUTHFAIL
++        ZLog::Write(($ex instanceof AuthenticationRequiredException) ? LOGLEVEL_INFO : LOGLEVEL_FATAL, sprintf('Exception: (%s) - %s', $exclass, $exception_message));
+ 
+         if(!headers_sent()) {
+             if ($ex instanceof ZPushException) {

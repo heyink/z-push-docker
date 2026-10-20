@@ -17,11 +17,19 @@ x-zpush: &zpush
     - "80"
   networks:
     - caddy_net
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
   healthcheck:
-    test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1/ || exit 1"]
+    # Unauthenticated request must reach Z-Push and return 401 (500 = PHP/config error)
+    test: ["CMD-SHELL", "code=$$(curl -s -o /dev/null -A zpush-healthcheck -w '%{http_code}' http://127.0.0.1/Microsoft-Server-ActiveSync) && [ \"$$code\" = 401 ]"]
     interval: 30s
-    timeout: 5s
-    retries: 5
+    timeout: 10s
+    retries: 3
     start_period: 20s
 
 services:

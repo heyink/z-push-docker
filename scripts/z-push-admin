@@ -1,0 +1,4 @@
+#!/bin/sh
+# Run Z-Push admin CLI as the web user with the generated config.
+cd "${ZPUSH_HOME:-/usr/share/z-push}" || exit 1
+exec setpriv --reuid=www-data --regid=www-data --init-groups php -d error_reporting='E_ALL & ~E_DEPRECATED' z-push-admin.php "$@"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Live view of Z-Push processes (needs a TTY: docker exec -it <container> z-push-top)
+cd "${ZPUSH_HOME:-/usr/share/z-push}" || exit 1
+exec setpriv --reuid=www-data --regid=www-data --init-groups php -d error_reporting='E_ALL & ~E_DEPRECATED' z-push-top.php "$@"

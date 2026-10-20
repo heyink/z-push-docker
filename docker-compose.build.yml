@@ -1,7 +1,7 @@
 # Optional override for local builds (does not push to GHCR).
 services:
   z-push:
-    image: z-push-imap:2.7.6
+    image: z-push-docker:local
     build:
       context: .
       args:
