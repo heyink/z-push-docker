@@ -5,3 +5,5 @@
 /data/
 /state/
 /logs/
+# multi-instance env files (keep only *.example in git)
+examples/**/*.env

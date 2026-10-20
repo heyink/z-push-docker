@@ -55,6 +55,48 @@ These are typical values only — always confirm in your provider panel.
 
 Z-Push 2.7.6’s IMAP backend **polls** IMAP during ActiveSync Ping (`PING_INTERVAL`, default 30s). It is not the same as native IMAP IDLE (IDLE exists on Z-Push `develop`, not in 2.7.6). Latency ≈ poll interval + network.
 
+## Multiple providers = multiple containers
+
+Z-Push's IMAP backend talks to exactly **one** IMAP/SMTP server per instance (`IMAP_SERVER` is a single constant). To serve mailboxes at different providers (e.g. a MXroute-hosted domain and Gmail), run **one container per provider** from the same image. Nothing in the image is instance-specific: config is generated at container start from env vars, and state/logs live in per-container volumes.
+
+See [`examples/multi-instance/`](examples/multi-instance/):
+
+| File | Purpose |
+|------|---------|
+| `docker-compose.yml` | two services (`zpush-mxroute`, `zpush-gmail`), separate volumes, separate caddy-docker-proxy labels |
+| `.env.example` | compose-level vars: `IMAGE`, `CADDY_NETWORK`, hostnames used in labels |
+| `mxroute.env.example` / `gmail.env.example` | per-container IMAP/SMTP/folder settings (`env_file`) |
+
+```bash
+cd examples/multi-instance
+cp .env.example .env && cp mxroute.env.example mxroute.env && cp gmail.env.example gmail.env
+docker compose config && docker compose up -d
+```
+
+Label hostnames must be in `.env` (compose interpolation); `env_file` values are only passed into the container.
+
+### Gmail / Google Workspace notes
+
+- IMAP `imap.gmail.com:993` (SSL), SMTP `smtp.gmail.com:465` (SSL) or 587 (STARTTLS) — [Google: IMAP, POP, and SMTP](https://developers.google.com/workspace/gmail/imap/imap-smtp).
+- Z-Push's IMAP backend only does password login (no XOAUTH2), so use a **Google App Password**, which requires 2-Step Verification and may be unavailable for Workspace accounts if the admin disabled it — [Sign in with app passwords](https://support.google.com/accounts/answer/185833).
+- Autodiscover for `@gmail.com` cannot point at your server: on the phone choose Exchange and enter the server (e.g. `gmail-eas.example.com`) manually. The Gmail instance needs only one hostname.
+- Folder names: Gmail exposes system labels under `[Gmail]/` (or `[Google Mail]/`) and marks them with RFC 6154 special-use flags (`\Sent`, `\Trash`, `\All` …) — [Gmail IMAP extensions](https://developers.google.com/workspace/gmail/imap/imap-extensions). Z-Push 2.7.6 does **not** read those flags; it compares the raw IMAP name with `IMAP_FOLDER_*`, so names must match exactly (raw modified UTF-7 if localized).
+- Exclude `[Gmail]/All Mail`, `[Gmail]/Important`, `[Gmail]/Starred` (they duplicate messages from other labels).
+- Gmail allows ~15 simultaneous IMAP connections per account.
+
+#### Check folder names
+
+```bash
+docker exec -it zpush-gmail php -r '
+$m = imap_open("{imap.gmail.com:993/imap/ssl}", "you@gmail.com", getenv("PW") ?: trim(fgets(STDIN)), OP_HALFOPEN);
+foreach (imap_getmailboxes($m, "{imap.gmail.com:993/imap/ssl}", "*") as $b) {
+  $raw = substr($b->name, strpos($b->name, "}") + 1);
+  printf("%-40s %s\n", $raw, mb_convert_encoding($raw, "UTF-8", "UTF7-IMAP"));
+}'
+```
+
+Use the **left (raw)** column for `IMAP_FOLDER_*`. If a raw name contains `&`, write it as `\&` in the env file (the entrypoint passes values through `sed`).
+
 ## Optional Caddyfile
 
 If you do not use docker-proxy labels, see `caddy/Caddyfile.snippet`.
@@ -90,6 +132,12 @@ DNS 示例：`eas.example.com`、`autodiscover.example.com` 的 A/AAAA 指向 VP
 ### 关于推送速度
 
 2.7.6 IMAP 后端在 Ping 期间仍是 **轮询** IMAP，延迟约等于 `PING_INTERVAL`。正式版不含 IMAP IDLE。
+
+### 多服务商 = 多个容器
+
+Z-Push IMAP 后端每个实例只能连 **一个** IMAP/SMTP 服务器。不同服务商（如 MXroute 域名邮箱 + Gmail）请用同一镜像跑 **多个容器**：各自的 env 文件、各自的 state/log 卷、各自的 Caddy 主机名。示例见 `examples/multi-instance/`。
+
+Gmail 要点：`imap.gmail.com:993` SSL、`smtp.gmail.com:465` SSL；必须用 **应用专用密码**（需开启两步验证；Workspace 可能被管理员禁用）；Z-Push 不支持 OAuth。`@gmail.com` 无法自动发现到你的服务器，手机上手动填写服务器（如 `gmail-eas.example.com`），Gmail 实例只需一个主机名。Gmail 文件夹名可能随网页语言本地化，Z-Push 2.7.6 不识别 SPECIAL-USE 标记，需按上面的命令列出原始（UTF-7）名称并填写；原始名中的 `&` 需写成 `\&`。建议排除 `[Gmail]/All Mail|[Gmail]/Important|[Gmail]/Starred`。
 
 ### 许可
 

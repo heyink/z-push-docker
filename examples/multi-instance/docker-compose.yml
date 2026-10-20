@@ -1,0 +1,72 @@
+# Multi-provider = multiple Z-Push containers (one per IMAP/SMTP provider).
+# Same image, separate env file, separate state/log volumes, separate hostname.
+#
+#   cp .env.example .env                 # hostnames for Caddy labels (compose interpolation)
+#   cp mxroute.env.example mxroute.env   # container env for instance 1
+#   cp gmail.env.example gmail.env       # container env for instance 2
+#   docker compose config                # validate
+#   docker compose pull && docker compose up -d
+#
+# NOTE: label values are interpolated from THIS directory's .env (or shell),
+# NOT from env_file — so hostnames live in .env, IMAP/SMTP settings in *.env.
+
+x-zpush: &zpush
+  image: ${IMAGE:-ghcr.io/heyink/z-push-docker:latest}
+  restart: unless-stopped
+  expose:
+    - "80"
+  networks:
+    - caddy_net
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1/ || exit 1"]
+    interval: 30s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+
+services:
+  # Instance 1: provider with its own domain (EAS + Autodiscover)
+  zpush-mxroute:
+    <<: *zpush
+    container_name: zpush-mxroute
+    env_file: mxroute.env
+    volumes:
+      - mxroute_state:/var/lib/z-push
+      - mxroute_logs:/var/log/z-push
+    labels:
+      caddy: "${MXROUTE_EAS_DOMAIN:?set MXROUTE_EAS_DOMAIN in .env}, ${MXROUTE_AUTODISCOVER_DOMAIN:?set MXROUTE_AUTODISCOVER_DOMAIN in .env}"
+      caddy.reverse_proxy: "{{upstreams 80}}"
+      caddy.reverse_proxy.flush_interval: "-1"
+      caddy.reverse_proxy.transport: http
+      caddy.reverse_proxy.transport.read_timeout: 30m
+      caddy.reverse_proxy.transport.write_timeout: 30m
+      caddy.reverse_proxy.transport.response_header_timeout: 30m
+
+  # Instance 2: Gmail — EAS hostname only (autodiscover for @gmail.com
+  # can never reach your server; enter the server manually on the phone)
+  zpush-gmail:
+    <<: *zpush
+    container_name: zpush-gmail
+    env_file: gmail.env
+    volumes:
+      - gmail_state:/var/lib/z-push
+      - gmail_logs:/var/log/z-push
+    labels:
+      caddy: "${GMAIL_EAS_DOMAIN:?set GMAIL_EAS_DOMAIN in .env}"
+      caddy.reverse_proxy: "{{upstreams 80}}"
+      caddy.reverse_proxy.flush_interval: "-1"
+      caddy.reverse_proxy.transport: http
+      caddy.reverse_proxy.transport.read_timeout: 30m
+      caddy.reverse_proxy.transport.write_timeout: 30m
+      caddy.reverse_proxy.transport.response_header_timeout: 30m
+
+volumes:
+  mxroute_state:
+  mxroute_logs:
+  gmail_state:
+  gmail_logs:
+
+networks:
+  caddy_net:
+    name: ${CADDY_NETWORK:-caddy}
+    external: true
